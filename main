@@ -201,12 +201,19 @@ def main():
     logger.info(f"Device UID: {DEVICE_UID}")
     logger.info("Setting up schedule for 6:00, 9:00, 12:00, 15:00, and 18:00 JST")
     
-    # Schedule jobs at specific times (JST)
-    schedule.every().day.at("06:00").do(process_and_send_data)
-    schedule.every().day.at("09:00").do(process_and_send_data)
-    schedule.every().day.at("12:00").do(process_and_send_data)
-    schedule.every().day.at("15:00").do(process_and_send_data)
-    schedule.every().day.at("18:00").do(process_and_send_data)
+    # Check if test mode is enabled via command line argument
+    test_mode = False
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        test_mode = True
+        logger.info("TEST MODE: Will run continuously every minute")
+        schedule.every(1).minutes.do(process_and_send_data)
+    else:
+        # Normal scheduled operation
+        schedule.every().day.at("06:00").do(process_and_send_data)
+        schedule.every().day.at("09:00").do(process_and_send_data)
+        schedule.every().day.at("12:00").do(process_and_send_data)
+        schedule.every().day.at("15:00").do(process_and_send_data)
+        schedule.every().day.at("18:00").do(process_and_send_data)
     
     logger.info("Running initial data collection and sending")
     process_and_send_data()  # Run once at startup
