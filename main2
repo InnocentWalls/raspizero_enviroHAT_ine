@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+
+import time
+import json
+import logging
+from datetime import datetime, timezone, timedelta
+import sys
+import os
+import socket
+import schedule
+import backoff
+from mastodon import Mastodon
+
+# Import Enviro+ libraries
+from bme280 import BME280
+from ltr559 import LTR559
+
+try:
+    from smbus2 import SMBus
+except ImportError:
+    from smbus import SMBus
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("enviroplus_mastodon.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("enviroplus_mastodon")
+
+# Mastodon設定
+MASTODON_SERVER = "https://social.mikutter.hachune.net/"  # あなたのMastodonインスタンスのURLに変更してください
+MASTODON_ACCESS_TOKEN = "8H95zltj-XT9cfPGajLBLcgPKeUSAUf3jrMOQWq_N1E"  # あなたのアクセストークンに変更してください
+APP_NAME = "EnviroPlus Weather Bot"
+
+# デバイス設定
+DEVICE_NICKNAME = "weather-test"
+DEVICE_UID = "e6614c775b8c4035"
+MAX_RETRIES = 5
+DATA_BACKUP_PATH = "backup_data"
+
+# Set up the sensors
+bus = SMBus(1)
+bme280 = BME280(i2c_dev=bus)
+ltr559 = LTR559()
+
+# Create backup directory if it doesn't exist
+if not os.path.exists(DATA_BACKUP_PATH):
+    os.makedirs(DATA_BACKUP_PATH)
+
+# Mastodon APIクライアント設定
+def setup_mastodon():
+    try:
+        # アクセストークンを使用してMastodonクライアントを初期化
+        mastodon = Mastodon(
+            access_token=MASTODON_ACCESS_TOKEN,
+            api_base_url=MASTODON_SERVER
+        )
+        
+        # 接続テスト
+        account = mastodon.account_verify_credentials()
+        logger.info(f"Connected to Mastodon as @{account.username}")
+        
+        return mastodon
+    except Exception as e:
+        logger.error(f"Error setting up Mastodon client: {e}")
+        return None
+
+# Function to read sensor data
+def read_sensors():
+    try:
+        # Read temperature, pressure, and humidity from BME280
+        temperature = bme280.get_temperature()
+        raw_pressure = bme280.get_pressure()
+        raw_humidity = bme280.get_humidity()
+        
+        # Read light from LTR559
+        light = ltr559.get_lux()
+        
+        # 気圧の異常値チェックと補正
+        # 正常範囲: 約950hPa〜1050hPa (海面気圧の一般的な変動範囲)
+        if raw_pressure < 950 or raw_pressure > 1050:
+            # 床置き状態のキャリブレーション値(728hPa→1005hPaに補正)を使用
+            pressure_correction_factor = 1.38
+            corrected_pressure = raw_pressure * pressure_correction_factor
+            
+            # それでも範囲外の場合は標準気圧に近い値を使用
+            if corrected_pressure < 950 or corrected_pressure > 1050:
+                logger.warning(f"Abnormal pressure reading after correction: {corrected_pressure}hPa, using default value")
+                corrected_pressure = 1013.25  # 標準気圧
+        else:
+            # 生の値が正常範囲内ならそのまま使用
+            corrected_pressure = raw_pressure
+        
+        # 湿度の補正と異常値チェック
+        # 典型的な補正係数 (77.39%→48.8%に補正した係数)
+        humidity_correction_factor = 0.63
+        corrected_humidity = raw_humidity * humidity_correction_factor
+        
+        # 湿度は0%〜100%の範囲に制限
+        corrected_humidity = max(0, min(100, corrected_humidity))
+        
+        # ログ出力
+        logger.debug(f"Raw sensor readings - Temp: {temperature}°C, Pressure: {raw_pressure}hPa, Humidity: {raw_humidity}%, Light: {light}lux")
+        logger.debug(f"Corrected readings - Pressure: {corrected_pressure}hPa, Humidity: {corrected_humidity}%")
+        
+        # 安定した値を返す
+        return {
+            "temperature": round(temperature, 2),
+            "humidity": round(corrected_humidity, 2),
+            "pressure": round(corrected_pressure, 2),
+            "light": round(light, 2)
+        }
+    except Exception as e:
+        logger.error(f"Error reading sensors: {e}")
+        # Return previous values if available or default values
+        return {
+            "temperature": 0.0,
+            "humidity": 0.0,
+            "pressure": 0.0,
+            "light": 0.0
+        }
+
+# Check internet connection
+def is_connected():
+    try:
+        # Try to resolve a common reliable domain
+        socket.create_connection(("1.1.1.1", 53), timeout=3)
+        return True
+    except OSError:
+        pass
+    return False
+
+# Backup data to a file
+def backup_data(data, timestamp):
+    filename = os.path.join(DATA_BACKUP_PATH, f"data_{timestamp.replace(':', '-')}.json")
+    try:
+        with open(filename, "w") as f:
+            json.dump(data, f)
+        logger.info(f"Data backed up to {filename}")
+        return filename
+    except Exception as e:
+        logger.error(f"Failed to backup data: {e}")
+        return None
+
+# Try to send backed up data
+def post_backed_up_data(mastodon_client):
+    if not is_connected():
+        logger.warning("No internet connection. Skipping backed up data posting.")
+        return
+
+    files = os.listdir(DATA_BACKUP_PATH)
+    if not files:
+        return
+    
+    logger.info(f"Found {len(files)} backed up data files to post")
+    
+    for filename in files:
+        filepath = os.path.join(DATA_BACKUP_PATH, filename)
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+                
+            # Try to post the data
+            success = post_to_mastodon_with_retry(mastodon_client, data)
+            
+            # If successfully posted, remove the backup file
+            if success:
+                os.remove(filepath)
+                logger.info(f"Backed up data {filename} posted and file removed")
+        except Exception as e:
+            logger.error(f"Error processing backed up file {filename}: {e}")
+
+# Function to post to Mastodon with exponential backoff
+@backoff.on_exception(
+    backoff.expo,
+    Exception,
+    max_tries=MAX_RETRIES
+)
+def post_to_mastodon_with_backoff(mastodon_client, status_text):
+    return mastodon_client.status_post(status_text, visibility="public")
+
+# Send data with retry logic
+def post_to_mastodon_with_retry(mastodon_client, sensor_data):
+    try:
+        if not is_connected():
+            logger.warning("No internet connection. Backing up data.")
+            backup_data(sensor_data, datetime.now().isoformat())
+            return False
+        
+        # Create text for Mastodon post
+        status_text = create_status_text(sensor_data)
+        
+        # Post to Mastodon
+        post_to_mastodon_with_backoff(mastodon_client, status_text)
+        logger.info(f"Data posted to Mastodon successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error posting to Mastodon: {e}")
+        backup_data(sensor_data, datetime.now().isoformat())
+        return False
+
+# Create text for Mastodon post
+def create_status_text(sensor_data):
+    japan_timezone = timezone(timedelta(hours=9))
+    current_time = datetime.now(japan_timezone).strftime("%Y年%m月%d日 %H:%M:%S JST")
+    
+    return f"""【{DEVICE_NICKNAME}の観測データ】{current_time}
+
+🌡️ 気温: {sensor_data['temperature']}°C
+💧 湿度: {sensor_data['humidity']}%
+🌪️ 気圧: {sensor_data['pressure']}hPa
+☀️ 照度: {sensor_data['light']}lux
+
+#EnviroPlus #気象データ #{DEVICE_NICKNAME}"""
+
+# Function to process data and post to Mastodon
+def process_and_post_data(mastodon_client):
+    logger.info("Running scheduled data collection and posting")
+    
+    # Read sensor data
+    sensor_data = read_sensors()
+    
+    # Try to post data to Mastodon
+    post_to_mastodon_with_retry(mastodon_client, sensor_data)
+    
+    # Try to post any backed up data
+    post_backed_up_data(mastodon_client)
+
+def main():
+    logger.info("Starting Enviro+ Mastodon poster")
+    logger.info(f"Device UID: {DEVICE_UID}")
+    
+    # Setup Mastodon client
+    mastodon_client = setup_mastodon()
+    if not mastodon_client:
+        logger.error("Failed to set up Mastodon client. Exiting.")
+        return 1
+    
+    # Check if test mode is enabled via command line argument
+    test_mode = False
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        test_mode = True
+        logger.info("TEST MODE: Will run continuously every minute")
+        schedule.every(1).minutes.do(lambda: process_and_post_data(mastodon_client))
+    else:
+        # Normal scheduled operation (JST)
+        logger.info("Setting up schedule for 6:00, 9:00, 12:00, 15:00, and 18:00 JST")
+        schedule.every().day.at("06:00").do(lambda: process_and_post_data(mastodon_client))
+        schedule.every().day.at("09:00").do(lambda: process_and_post_data(mastodon_client))
+        schedule.every().day.at("12:00").do(lambda: process_and_post_data(mastodon_client))
+        schedule.every().day.at("15:00").do(lambda: process_and_post_data(mastodon_client))
+        schedule.every().day.at("18:00").do(lambda: process_and_post_data(mastodon_client))
+    
+    logger.info("Running initial data collection and posting")
+    process_and_post_data(mastodon_client)  # Run once at startup
+    
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(30)  # Check every 30 seconds
+            
+    except KeyboardInterrupt:
+        logger.info("Program stopped by user")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return 1
+    
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
